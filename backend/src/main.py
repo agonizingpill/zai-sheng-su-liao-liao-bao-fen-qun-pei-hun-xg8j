@@ -10,6 +10,7 @@ from .models import User,Bale,Blend,BlendPortion,Audit
 from .schemas import Login,BaleIn,BlendIn,PortionsIn
 from .security import current,allow,password_hash,token_for
 from .blending import obj,get,audit,view,set_portions,evaluate,release
+from .trace_models import ProcessGate,LotImpact,LotImpactShipment
 from .middlewares import RequestTrace,Recovery
 from scripts.seed_demo import seed
 import json
@@ -18,6 +19,13 @@ r=Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0'),decode_responses=
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    # Create the serialization row up front so quarantine and product actions
+    # always contend on an existing PK row instead of racing to insert it.
+    with Session.begin()as s:
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+        from .lot_trace import GATE
+        if engine.dialect.name=='mysql':s.execute(mysql_insert(ProcessGate).prefix_with('IGNORE').values(name=GATE))
+        elif not s.get(ProcessGate,GATE):s.add(ProcessGate(name=GATE))
     if os.getenv('SEED_DEMO','true')=='true':
         try:seed()
         except Exception:logging.exception('seed failed')

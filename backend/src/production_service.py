@@ -8,6 +8,7 @@ from .models import Blend
 from .quality_models import PelletCheck
 from .production_models import Dryer,DryingRun,PelletPack,BlendShipment,ShipmentPack
 from .blending import obj,get,audit,view
+from . import lot_trace
 
 def stamp(v):return (v.replace(tzinfo=ZoneInfo('Asia/Shanghai'))if v.tzinfo is None else v).astimezone(timezone.utc)
 def now():return datetime.now(timezone.utc).isoformat()
@@ -52,33 +53,46 @@ def available_pack_weight(s,p,kg,exclude=None):
     used=sum((x.kg for x in s.scalars(select(PelletPack).where(PelletPack.check_id==p.id,PelletPack.state!='cancelled').with_for_update().execution_options(populate_existing=True))if x.id!=exclude),Decimal(0))
     if used+kg>p.actual_kg:raise HTTPException(409,'累计有效包装重量超过合格粒料产出，不分配超额箱码')
 def create_pack(s,p,u):
+    lot_trace.gate(s)
     check=get(s,PelletCheck,p.check_id,True)
     if check.state!='certified':raise HTTPException(409,'仅主管已发合格证的成品可以包装')
+    lot_trace.ensure_product_open(s,check.blend_id,'新建包装箱码')
     available_pack_weight(s,check,p.kg);x=PelletPack(**p.model_dump(),state='open',certificate_snapshot=check.certificate_snapshot);s.add(x);s.flush();audit(s,u,'pack_created',x.code);return pack_view(s,x)
 def change_pack(s,id,p,u):
-    candidate=get(s,PelletPack,id);check=get(s,PelletCheck,candidate.check_id,True);x=get(s,PelletPack,id,True)
+    lot_trace.gate(s)
+    candidate=get(s,PelletPack,id);check=get(s,PelletCheck,candidate.check_id,True)
+    lot_trace.ensure_product_open(s,check.blend_id,'修改包装重量')
+    x=get(s,PelletPack,id,True)
     if x.state!='open':raise HTTPException(409,'只有未封包装可改重量，封包与出库后冻结')
     available_pack_weight(s,check,p.kg,x.id);x.kg=p.kg;audit(s,u,'pack_reweighed',x.code);return pack_view(s,x)
 def pack_action(s,id,u,target):
-    candidate=get(s,PelletPack,id);get(s,PelletCheck,candidate.check_id,True);x=get(s,PelletPack,id,True)
+    lot_trace.gate(s)
+    candidate=get(s,PelletPack,id);check=get(s,PelletCheck,candidate.check_id,True)
+    lot_trace.ensure_product_open(s,check.blend_id,'封包或取消包装')
+    x=get(s,PelletPack,id,True)
     if x.state!='open':raise HTTPException(409,'仅未封包装可封包或取消，不可重复')
     x.state=target;audit(s,u,'pack_'+target,x.code);return pack_view(s,x)
 def load_pack(s,id,p,u):
+    lot_trace.gate(s)
     sh=get(s,BlendShipment,id,True)
-    if sh.state!='loading':raise HTTPException(409,'发车后清单冻结，不能继续装车')
     pack=get(s,PelletPack,p.pack_id,True)
+    check=get(s,PelletCheck,pack.check_id)
+    if sh.state!='loading':raise HTTPException(409,'发车后清单冻结，不能继续装车')
+    lot_trace.ensure_check_open(s,check.id,'装车')
     if pack.state!='sealed':raise HTTPException(409,'只有已封箱且未装车箱码可装入清单')
     if s.scalar(select(ShipmentPack.id).where(ShipmentPack.pack_id==pack.id)):raise HTTPException(409,'箱码已装车，不得重复出库')
-    check=get(s,PelletCheck,pack.check_id)
     for link in s.scalars(select(ShipmentPack).where(ShipmentPack.shipment_id==sh.id)):
         previous=get(s,PelletCheck,get(s,PelletPack,link.pack_id).check_id)
         if previous.blend_id!=check.blend_id:raise HTTPException(409,'同一车次只允许同配方成品，不可跨配方混装')
     s.add(ShipmentPack(shipment_id=sh.id,pack_id=pack.id,pack_snapshot=pack_view(s,pack)));pack.state='loaded';s.flush();audit(s,u,'shipment_loaded',sh.code+' / '+pack.code);return ship_view(s,sh)
 def dispatch(s,id,u):
+    lot_trace.gate(s)
     sh=get(s,BlendShipment,id,True)
     if sh.state!='loading':raise HTTPException(409,'仅装车中清单可发车，不可重复出库')
     snap=ship_view(s,sh)
     if not snap['packs']:raise HTTPException(409,'清单没有已封箱成品，不能发车')
+    blend_ids=sorted({get(s,PelletCheck,get(s,PelletPack,p['pack_id']).check_id).blend_id for p in snap['packs']})
+    for blend_id in blend_ids:lot_trace.ensure_product_open(s,blend_id,'发车')
     sh.manifest={'code':sh.code,'customer':sh.customer,'packs':snap['packs'],'total_kg':snap['total_kg'],'at':now(),'dispatched_by':u['email']};sh.dispatched_by=u['email'];sh.state='dispatched';audit(s,u,'shipment_dispatched',sh.code);return ship_view(s,sh)
 def receive(s,id,p,u):
     sh=get(s,BlendShipment,id,True)

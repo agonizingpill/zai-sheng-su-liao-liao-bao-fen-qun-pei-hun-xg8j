@@ -4,6 +4,7 @@ export const AUDIT_ACTIONS={bale_received:'来料登记',bale_retested:'料包�
 
 export const LOT_STATES={active:'来料可用',quarantine:'整批隔离'};
 export const PELLET_STATES={quarantine:'PVC越限隔离',passed:'检验合格待签证',certified:'主管已发合格证'};
+export const IMPACT_STATES={blocked:'已拦截（未出库）',recall_pending:'已出库待召回',cleared:'本批影响已解除'};
 
 export const DRYING_STATES={drying:'烘干中',redry:'超含水待延烘',passed:'含水合格待验收',accepted:'主管已验收'};
 export const PACK_STATES={open:'未封可调整',sealed:'已封箱',cancelled:'未封取消',loaded:'已装车冻结'};

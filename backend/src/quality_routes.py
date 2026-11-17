@@ -4,8 +4,9 @@ from .database import Session
 from .security import current,allow
 from .quality_models import SupplierLot,PelletCheck
 from .quality_schemas import LotIn,BaleAssignment,LotDecision,PelletIn,PelletRetest
-from .blending import audit
+from .blending import audit,get
 from . import quality_service as svc
+from . import lot_trace
 router=APIRouter()
 @router.get('/supplier-lots')
 def lots(u=Depends(current)):
@@ -30,6 +31,12 @@ def clear(lid:int,p:LotDecision,u=Depends(current)):
 @router.get('/pellet-checks')
 def pellets(u=Depends(current)):
     with Session() as s:return [svc.pellet_view(s,x) for x in s.scalars(select(PelletCheck).order_by(PelletCheck.id.desc()))]
+@router.get('/lot-impacts')
+def impacts(u=Depends(current)):
+    with Session() as s:return lot_trace.all_impacts_view(s)
+@router.get('/pellet-checks/{id}/trace')
+def trace(id:int,u=Depends(current)):
+    with Session() as s:return lot_trace.product_view(s,get(s,PelletCheck,id))
 @router.post('/pellet-checks')
 def create_check(p:PelletIn,u=Depends(current)):
     allow(u,'admin','blender')

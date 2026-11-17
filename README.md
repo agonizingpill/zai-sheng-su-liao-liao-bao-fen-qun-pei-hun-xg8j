@@ -19,7 +19,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 |---|---|---|---|
 |admin 投料主管|admin@huanli.local|Blend2026!|全部操作、最终投料放行、供应批隔离/解除、烘干验收、成品证书签发、发车冻结清单|
 |blender 配混员|blender@huanli.local|Blend2026!|检验、分群、立单、称料、审秤、待放行单退回；供应批挂包、粒料取样与隔离复检、烘干安排/复测、包装称重/封箱、客户签收；无最终投料及发证权限|
-|viewer 质检观察员|viewer@huanli.local|Blend2026!|只读九个页面及交接轨迹|
+|viewer 质检观察员|viewer@huanli.local|Blend2026!|只读十个页面及交接轨迹|
 
 ## 业务流程与约束
 
@@ -30,6 +30,9 @@ docker compose exec -T backend python -m scripts.seed_demo
 5. 主管放行先锁配方，再按料包ID顺序`SELECT FOR UPDATE`；重新校验余量后，在一个事务扣减所有料包，配方变released并保存签署人。任一失败整体回滚。重复放行、已放行改单和退回都拒绝。
 
 6. 供应隔离复核：新批次记录供应商与首检依据；料包归属唯一，记录入批质量快照。主管隔离/解除必须填写至少8字依据。隔离批次阻止配方新审秤和已经ready配方最终投料；检查在原配混事务内生效。挂批、隔离和投料按料包→供应批顺序锁定。已投料料包禁止事后补挂，避免改变追溯。历史未挂批料仍保留原流程兼容性。
+
+6a. 隔离沿实际投料往下游传导：按`供应批→已投料料包(称料快照)→已放行配方→成品粒料检验→箱码→车次`回溯，而不是看堆场当前归属。每个(供应批,成品)只保留一条处置记录：未出库的记`blocked`，已发车/已签收的记`recall_pending`并保存当时的冻结清单快照。隔离后该成品的新签证、新建/改重/封箱/取消包装、装车、发车均实时拒绝；隔离前已出库的车次保留原证书与原清单，只新增待召回标记。隔离与发车/签证/包装并发时共用一行`process_gates`行锁，按提交先后落定为“拒绝”或“待召回”，整个处置与标记在同一事务，失败不留半套。重复隔离/解除不重复写处置；多批牵连同一成品时解除一批只撤销本批行，其余批仍拦截；历史证书、称料与群号快照、冻结manifest均不改写。成品登记时若来源批已隔离，自动补一条处置。
+
 7. 粒料检验放行：仅released配方取样，产出不得超过实际投料，MI必须正值；PVC大于原配方上限记录quarantine，合格记passed。隔离料可按依据追加复检，首次异常不覆盖。主管只可对passed记录发唯一HL-CERT证书，保存投料/称料/质量/来源与最新检验快照，之后不可重复发证或复检覆盖。
 
 8. 烘干含水复检：主管登记Dryer设备，released配方开DryingRun，设备行锁核时段，配方唯一作业；投入含水由称料质量快照加权计算。含水>0.05%记redry，延烘结束不可倒退且须重查设备后续占用；复测≤0.05%记passed，主管验收accepted后才允许成品新签证，证书加入烘干快照；旧certified不重算。
@@ -43,6 +46,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 08:30检验员核对PET-117/118，原始与可用均500kg；09:00配混员为45包运行分群；09:30在BL-20261117分别称入200kg、200kg，目标400kg，PVC门限40ppm；10:00审秤通过；10:30故意跨群配料，被拒并且余量不变；11:00查看PVC门限5ppm配方超限，不允许投料；14:00主管放行BL-20261117，两包各剩300kg；15:00两份400kg配方同时争用PET-119的500kg，只有一份能放行，剩100kg；16:00交接簿查看签署与冻结记录。
 
 17:00在「供应隔离复核」查看SL-ACCEPT-17（PET-129可用）与SL-HOLD-17（PET-131隔离），将新批SL-03关联PET-124；先审秤后隔离，再尝试最终投料，应实时拒绝且不扣料。主管按复检说明解除后方可投料。17:30已投料100kg配方的成品取样96kg、MI9.1、PVC65ppm，超过40ppm记隔离；清线复检24ppm，主管发合格证。初次65ppm、复检24ppm和投料快照全部保留。
+
+17:50把已投料成品涉及的供应批隔离，在「隔离影响核对」按实际投料看到受影响成品、来源料包与箱码：未出库的显示已拦截，新签证/包装/装车/发车均被拒；已发车的车次标为待召回，原冻结清单不变。解除该批后若另一批仍牵连同一成品，拦截继续保留。
 
 V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；实测0.04%，主管验收后成品96kg/20ppm才签证。包装PK-BROWSER-V3为25kg，封箱后放入SH-BROWSER-V3，客户华远注塑一号原料库，主管发车，客户签24.9kg，差率-0.4%保存。API另演练0.08%延烘、撞时段拒绝、包装超重/取消释放及超签收差异说明。
 
@@ -62,11 +67,11 @@ V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；
 
 `backend/src/models.py`：Bale、Blend、BlendPortion；`schemas.py`：字段范围；`blending.py`：称料、审秤、放行事务；`clustering.py`：实际算法；`worker.py`：队列与心跳；`main.py`：路由；`middlewares.py`：追踪/恢复。`backend/scripts/seed_demo.py`自然键只插入缺失演示记录，重复seed保留用户修改。
 
-`backend/src/quality_models.py`：SupplierLot/LotBale/PelletCheck；`quality_schemas.py`：批次、决策、取样与复检字段；`quality_service.py`：追溯挂批/主管隔离、质量平衡、历次检验与证书快照；`quality_routes.py`：`/supplier-lots` 与 `/pellet-checks`（含bales/quarantine/clear/retest/certify）。新建三张表，不修改原表列，已有数据通过create_all扩展，无破坏性迁移。
+`backend/src/lot_trace.py`：隔离沿实际投料传导、处置读写与门锁；`trace_models.py`：ProcessGate/LotImpact/LotImpactShipment（create_all新增3张表，原表列不变）；`quality_models.py`：SupplierLot/LotBale/PelletCheck；`quality_schemas.py`：批次、决策、取样与复检字段；`quality_service.py`：追溯挂批/主管隔离、质量平衡、历次检验与证书快照；`quality_routes.py`：`/supplier-lots`、`/pellet-checks`（含bales/quarantine/clear/retest/certify）与只读 `/lot-impacts`、`/pellet-checks/{id}/trace`。新建三张表，不修改原表列，已有数据通过create_all扩展，无破坏性迁移。
 
 V3 `backend/src/production_models.py`定义Dryer/DryingRun/PelletPack/BlendShipment/ShipmentPack；`production_schemas.py`校验时间、含水、称重与客户收货；`production_service.py`设备锁/时段重叠、累计包装锁、装车唯一和签收差率；`production_routes.py`提供`/dryers`、`/drying-runs`、`/pellet-packs`、`/blend-shipments`。新加5张表，原表列无变更，create_all兼容历史记录。
 
-`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
+`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收；`trace.js`隔离影响核对（逐成品列出实际来源料包、批次当前处置、箱码与待召回车次及原清单）。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
 
 Compose恰好frontend/backend/worker/db/redis五服务，全部healthcheck。MySQL健康检查采用127.0.0.1业务账号SELECT1，避开初始化临时socket；前端和后端也用127.0.0.1。数据库、Redis和模型文件/心跳分别为命名卷。宿主默认地址池已用尽，本项目显式10.221.26.0/24；换环境冲突时调整networks。环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET。内网DATABASE_URL/REDIS_URL/SEED_DEMO由Compose设置。
 
@@ -74,6 +79,6 @@ Compose恰好frontend/backend/worker/db/redis五服务，全部healthcheck。MyS
 
 ## 已知范围
 
-模拟45包检验资料，不接地磅/化验仪；无物理投料设备联动。配方与成品以PVC、重量平衡为硬门限，成品记录正值MI，未加入具体产品应用的MI/水分区间。供应来料隔离不追溯撤销已经投料和已经签发的成品证书；历史快照保留。成品包装与装车在本地记录受控出库清单，不接外部仓储或销售财务。烘干每配方一单，含水按实际取样手录，不接设备传感器或能耗表；设备时段包括已验收历史，不能重叠回填。未实现封箱拆包/已发车撤销，避免不受控重复出库。一个worker、Redis list；取任务后worker异常退出无可靠重投。每次聚类在全场已检验料包上计算，分群是辅助选料，不替代检测。历史已放行配方不可撤销，避免演示中不受控返库。演示JWT secret与账号密码在正式部署前更换。
+模拟45包检验资料，不接地磅/化验仪；无物理投料设备联动。配方与成品以PVC、重量平衡为硬门限，成品记录正值MI，未加入具体产品应用的MI/水分区间。供应来料隔离不追溯撤销已经投料和已经签发的成品证书，也不改写历史快照；它沿实际投料把受影响成品、箱码和车次拦下，已出库的登记为待召回（仅本地记录，不接运输/召回系统）。成品包装与装车在本地记录受控出库清单，不接外部仓储或销售财务。烘干每配方一单，含水按实际取样手录，不接设备传感器或能耗表；设备时段包括已验收历史，不能重叠回填。未实现封箱拆包/已发车撤销，避免不受控重复出库。一个worker、Redis list；取任务后worker异常退出无可靠重投。每次聚类在全场已检验料包上计算，分群是辅助选料，不替代检测。历史已放行配方不可撤销，避免演示中不受控返库。演示JWT secret与账号密码在正式部署前更换。
 
 License: MIT.
